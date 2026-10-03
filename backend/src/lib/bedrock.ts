@@ -48,15 +48,17 @@ function modelId(): string {
 
 /**
  * Invoke the configured Bedrock model with a single user prompt using the
- * Anthropic Messages body shape (the on-demand default), returning the model's
- * raw text output. Kept private: the only entry points are extract/explain.
+ * Amazon Nova request/response schema, returning the model's raw text output.
+ * Nova is invoked via an inference profile (e.g. global.amazon.nova-2-lite-v1:0);
+ * its body uses `schemaVersion`/`inferenceConfig` and the answer lives at
+ * `output.message.content[0].text`. Kept private: the only entry points are
+ * extract/explain.
  */
 async function invoke(prompt: string, maxTokens: number): Promise<string> {
   const body = JSON.stringify({
-    anthropic_version: 'bedrock-2023-05-31',
-    max_tokens: maxTokens,
-    temperature: 0,
-    messages: [{ role: 'user', content: [{ type: 'text', text: prompt }] }],
+    schemaVersion: 'messages-v1',
+    messages: [{ role: 'user', content: [{ text: prompt }] }],
+    inferenceConfig: { maxTokens, temperature: 0 },
   });
 
   const res = await client.send(
@@ -69,11 +71,11 @@ async function invoke(prompt: string, maxTokens: number): Promise<string> {
   );
 
   const payload = JSON.parse(textDecoder.decode(res.body)) as {
-    content?: { type?: string; text?: string }[];
+    output?: { message?: { content?: { text?: string }[] } };
   };
 
-  const text = (payload.content ?? [])
-    .map((block) => (block.type === 'text' ? (block.text ?? '') : ''))
+  const text = (payload.output?.message?.content ?? [])
+    .map((block) => block.text ?? '')
     .join('')
     .trim();
 
@@ -128,7 +130,7 @@ const EXTRACTION_INSTRUCTIONS = [
  */
 export async function bedrockExtract(req: ExtractionRequest): Promise<Extraction> {
   const basePrompt = `${EXTRACTION_INSTRUCTIONS}\n\nDOCUMENT:\n${req.text}`;
-  const maxAttempts = 3; // 1 initial + 2 retries
+  const maxAttempts = 2; // 1 initial + 1 retry (token-cost control)
   let lastError: unknown;
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
@@ -159,6 +161,132 @@ export async function bedrockExtract(req: ExtractionRequest): Promise<Extraction
   );
 }
 
+// ---------------------------------------------------------------------------
+// LLM semantic scoring (bedrockScore) — the primary scoring path.
+//
+// Replaces the deterministic string-match relevance/novelty/redundancy with a
+// genuine semantic JUDGEMENT made by the model against the user's FULL rich
+// profile text. The deterministic functions in `@app/shared` are kept as a
+// fallback (see the worker) and still produce freshness + MKV.
+// ---------------------------------------------------------------------------
+
+/** Enforced bedrockScore output shape. Scores are integers 0..100. */
+export const bedrockScoreResponseSchema = z.object({
+  relevance: z.number().min(0).max(100),
+  novelty: z.number().min(0).max(100),
+  redundancy: z.number().min(0).max(100),
+  reasoning: z.string().min(1).max(1500),
+});
+
+export type BedrockScoreResponse = z.infer<typeof bedrockScoreResponseSchema>;
+
+export interface ScoreRequest {
+  extraction: Extraction;
+  profile: Profile;
+}
+
+/**
+ * Maximum number of characters of the free-text "About you" context sent into a
+ * scoring/explain prompt. The schema allows up to 20,000 chars, but sending the
+ * whole thing in 2 of the 3 per-document LLM calls inflates tokens and
+ * multiplies throttling. We cap the context fed to the model to keep prompts
+ * cheap; the user's full text is still stored intact. Tune this if a larger
+ * context measurably improves scoring quality.
+ */
+export const MAX_PROFILE_CONTEXT_CHARS = 2000;
+
+/** Truncate the context to the cap, appending a short notice when cut. */
+function capContext(context: string): string {
+  if (context.length <= MAX_PROFILE_CONTEXT_CHARS) return context;
+  return `${context.slice(0, MAX_PROFILE_CONTEXT_CHARS)}\n[context truncated]`;
+}
+
+/**
+ * Render the user's profile as a single rich-text block for the scoring prompt.
+ * Every stored field is included so the model's judgement sees ALL the context,
+ * not a bag of keywords. List fields are joined into readable sentences; the
+ * free-text "About you" block (profile.context) carries the primary signal and
+ * is capped at {@link MAX_PROFILE_CONTEXT_CHARS} to bound prompt size.
+ */
+export function buildProfileText(profile: Profile): string {
+  const list = (label: string, arr: string[]) => (arr.length ? `${label}: ${arr.join('; ')}.` : '');
+  const parts = [
+    profile.context ? `About the user:\n${capContext(profile.context)}` : '',
+    list('High interests', profile.highInterests),
+    list('Medium interests', profile.mediumInterests),
+    list('Currently researching', profile.currentlyResearching),
+    list('Active contexts / projects', profile.activeContexts),
+    list('Already known (do not re-explain fundamentals of these)', profile.alreadyKnown),
+    list('Avoid content types', profile.avoidContentTypes),
+  ];
+  return parts.filter(Boolean).join('\n\n').trim();
+}
+
+const SCORING_INSTRUCTIONS = [
+  'You are a strict personal relevance engine for ONE specific user.',
+  'Judge a document against the user profile and output three scores (0-100) plus reasoning.',
+  'This is a SEMANTIC judgement about meaning and value, NOT keyword or string matching.',
+  '',
+  'relevance = how much this document matters to THIS user given their background, interests, active research and projects.',
+  'novelty = how much genuinely NEW capability/insight it brings relative to what the user already knows.',
+  'redundancy = how much the document merely repeats things the user already knows or has clearly seen.',
+  '',
+  'The user strongly prefers signal over volume. It is acceptable and often correct to score a document low and conclude it contains nothing sufficiently new or relevant.',
+  "'Already known' means do not re-explain fundamentals; a known topic can still score high only if it brings a genuinely new capability/pattern/limitation/benchmark/architectural implication, otherwise deprioritize introductory coverage.",
+  '',
+  "reasoning MUST explain WHY the document matters (or does not) FOR THIS USER'S BACKGROUND specifically — not a generic summary. 1 to 3 sentences, concrete.",
+  '',
+  'Return ONLY minified JSON (no markdown, no code fence, no prose) with EXACTLY these keys:',
+  '{"relevance":number,"novelty":number,"redundancy":number,"reasoning":string}',
+  'Each score is an integer 0-100. reasoning <= 1500 characters.',
+].join('\n');
+
+/**
+ * Score a document semantically against the user's full profile. Returns the
+ * three LLM scores plus a reasoning string (used as the recommendation
+ * explanation). Retries up to 2 times on a JSON/Zod failure, then throws so the
+ * worker can fall back to the deterministic scorer (Req: never lose a score).
+ */
+export async function bedrockScore(req: ScoreRequest): Promise<BedrockScoreResponse> {
+  const profileText = buildProfileText(req.profile) || '(The user has not described a profile.)';
+  const docBlock = JSON.stringify({
+    topics: req.extraction.topics,
+    concepts: req.extraction.concepts,
+    claims: req.extraction.claims,
+    difficulty: req.extraction.difficulty,
+    summary: req.extraction.summary,
+  });
+  const basePrompt = `${SCORING_INSTRUCTIONS}\n\nUSER PROFILE:\n${profileText}\n\nDOCUMENT:\n${docBlock}`;
+  const maxAttempts = 2; // 1 initial + 1 retry (token-cost control)
+  let lastError: unknown;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const prompt =
+      attempt === 1
+        ? basePrompt
+        : `${basePrompt}\n\nREMINDER: Your previous response was invalid. Respond with ONLY the minified JSON object described above and nothing else.`;
+
+    try {
+      const raw = await invoke(prompt, 1024);
+      const parsed = bedrockScoreResponseSchema.parse(parseJsonObject(raw));
+      return {
+        relevance: Math.round(parsed.relevance),
+        novelty: Math.round(parsed.novelty),
+        redundancy: Math.round(parsed.redundancy),
+        reasoning: parsed.reasoning.trim(),
+      };
+    } catch (err) {
+      lastError = err;
+    }
+  }
+
+  throw new Error(
+    `bedrockScore failed after ${maxAttempts} attempts: ${
+      lastError instanceof Error ? lastError.message : String(lastError)
+    }`
+  );
+}
+
 export interface ExplainInput {
   extraction: Extraction;
   scores: Scores;
@@ -181,8 +309,10 @@ export async function bedrockExplain(input: ExplainInput): Promise<string> {
     highInterests: profile.highInterests,
     mediumInterests: profile.mediumInterests,
     currentlyResearching: profile.currentlyResearching,
+    activeContexts: profile.activeContexts,
     alreadyKnown: profile.alreadyKnown,
-    context: profile.context,
+    // Cap the free-text context to bound prompt size (same cap as scoring).
+    context: profile.context ? capContext(profile.context) : profile.context,
   };
 
   const prompt = [
@@ -212,4 +342,64 @@ export async function bedrockExplain(input: ExplainInput): Promise<string> {
     .join('\n');
 
   return invoke(prompt, 1024);
+}
+
+// ---------------------------------------------------------------------------
+// Profile draft from free text (bedrockDraftProfileFromText) — "Import from URL"
+// / "paste text". Turns a block of text ABOUT a person into a DRAFT reading
+// profile the user then reviews and edits (never saved blind).
+// ---------------------------------------------------------------------------
+
+/** Enforced draft-profile output shape. Lists of short strings + a short context. */
+export const draftProfileResponseSchema = z.object({
+  highInterests: z.array(z.string()).max(100).default([]),
+  mediumInterests: z.array(z.string()).max(100).default([]),
+  currentlyResearching: z.array(z.string()).max(100).default([]),
+  alreadyKnown: z.array(z.string()).max(100).default([]),
+  activeContexts: z.array(z.string()).max(100).default([]),
+  avoidContentTypes: z.array(z.string()).max(100).default([]),
+  context: z.string().max(600).default(''),
+});
+
+export type DraftProfileResponse = z.infer<typeof draftProfileResponseSchema>;
+
+// Bound the text we feed into the single draft-generation call (token control).
+const MAX_DRAFT_SOURCE_CHARS = 20_000;
+
+const DRAFT_PROFILE_INSTRUCTIONS = [
+  'From the following text about a person, produce a draft reading profile as JSON',
+  '{highInterests[],mediumInterests[],currentlyResearching[],alreadyKnown[],activeContexts[],avoidContentTypes[],context(<=600 chars)}.',
+  'Only output minified JSON.',
+].join(' ');
+
+/**
+ * Generate a DRAFT reading profile from arbitrary text about a person. Reuses
+ * the same Nova {@link invoke} + {@link parseJsonObject} path as scoring, with a
+ * bounded retry on a JSON/validation failure. Returns the parsed draft; the
+ * caller fills the edit form with it (the draft is NEVER saved automatically).
+ */
+export async function bedrockDraftProfileFromText(text: string): Promise<DraftProfileResponse> {
+  const source = text.trim().slice(0, MAX_DRAFT_SOURCE_CHARS);
+  const basePrompt = `${DRAFT_PROFILE_INSTRUCTIONS}\n\nTEXT:\n${source}`;
+  const maxAttempts = 2; // 1 initial + 1 retry
+  let lastError: unknown;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const prompt =
+      attempt === 1
+        ? basePrompt
+        : `${basePrompt}\n\nREMINDER: Respond with ONLY the minified JSON object described above and nothing else.`;
+    try {
+      const raw = await invoke(prompt, 1024);
+      return draftProfileResponseSchema.parse(parseJsonObject(raw));
+    } catch (err) {
+      lastError = err;
+    }
+  }
+
+  throw new Error(
+    `bedrockDraftProfileFromText failed after ${maxAttempts} attempts: ${
+      lastError instanceof Error ? lastError.message : String(lastError)
+    }`
+  );
 }

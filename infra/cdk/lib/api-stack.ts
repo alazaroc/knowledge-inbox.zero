@@ -10,6 +10,7 @@ import * as eventsources from 'aws-cdk-lib/aws-lambda-event-sources';
 import * as s3 from 'aws-cdk-lib/aws-s3';
 import * as sqs from 'aws-cdk-lib/aws-sqs';
 import * as ssm from 'aws-cdk-lib/aws-ssm';
+import * as secretsmanager from 'aws-cdk-lib/aws-secretsmanager';
 import { NodejsFunction } from 'aws-cdk-lib/aws-lambda-nodejs';
 import { Construct } from 'constructs';
 import * as path from 'path';
@@ -22,8 +23,15 @@ interface ApiStackProps extends cdk.StackProps {
 // Bedrock foundation model for extraction + explanation (NFR-1.2). Single
 // provider, single configurable model id; env-overridable with a sensible
 // default so a redeploy can switch models without a code change.
-const BEDROCK_MODEL_ID =
-  process.env.BEDROCK_MODEL_ID ?? 'anthropic.claude-3-5-sonnet-20240620-v1:0';
+// Amazon Nova 2 Lite via the GLOBAL inference profile — the current mid-tier
+// Nova: more capable than Nova Lite v1 at a similar price. The Nova family in
+// eu-south-2 is only invocable through an inference profile (not on-demand); we
+// use the GLOBAL profile (`global.*`) instead of the EU one (`eu.*`) so AWS can
+// route the request to the least-loaded region in the whole partition, which
+// reduces throttling under load. The on-demand foundation-model id
+// (`amazon.nova-2-lite-v1:0`, no prefix) is NOT invocable here —
+// InvokeModel returns a ValidationException — so it must stay a profile id.
+const BEDROCK_MODEL_ID = process.env.BEDROCK_MODEL_ID ?? 'global.amazon.nova-2-lite-v1:0';
 
 export class ApiStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props: ApiStackProps) {
@@ -87,6 +95,20 @@ export class ApiStack extends cdk.Stack {
       deadLetterQueue: { maxReceiveCount: 3, queue: analysisDlq },
     });
 
+    // ── Secrets Manager: ONE secret holding every user's private-repo token ──
+    // A single secret whose value is a JSON map { "<userSub>": "<token>", ... }.
+    // One secret (not one-per-user) keeps cost flat (~$0.40/mo total) at this
+    // scale; the profile handler reads+writes the map, the worker reads it to
+    // fetch a user's private profile source. Tokens are fine-grained,
+    // read-only, single-repo PATs → low blast radius.
+    const profileTokens = new secretsmanager.Secret(this, 'ProfileTokens', {
+      secretName: naming.standard('profile-tokens'),
+      description: 'JSON map of userSub → private-repo access token (fine-grained, read-only).',
+      // Start as an empty JSON map (not a generated password) so the handler's
+      // JSON.parse succeeds on first read.
+      secretStringValue: cdk.SecretValue.unsafePlainText('{}'),
+    });
+
     const commonEnv = {
       COGNITO_USER_POOL_ID: userPoolId,
       COGNITO_CLIENT_ID: userPoolClientId,
@@ -95,6 +117,7 @@ export class ApiStack extends cdk.Stack {
       TABLE_BATCHES: tableNames.batches,
       TABLE_DOCUMENTS: tableNames.documents,
       ANALYSIS_QUEUE_URL: analysisQueue.queueUrl,
+      PROFILE_TOKENS_SECRET: profileTokens.secretName,
     };
 
     // ── HTTP API (API Gateway v2): cheaper and faster than REST, with a native JWT authorizer. ──
@@ -112,6 +135,7 @@ export class ApiStack extends cdk.Stack {
           apigwv2.CorsHttpMethod.GET,
           apigwv2.CorsHttpMethod.POST,
           apigwv2.CorsHttpMethod.PUT,
+          apigwv2.CorsHttpMethod.PATCH,
           apigwv2.CorsHttpMethod.DELETE,
           apigwv2.CorsHttpMethod.OPTIONS,
         ],
@@ -155,6 +179,38 @@ export class ApiStack extends cdk.Stack {
 
     const M = apigwv2.HttpMethod;
 
+    // Bedrock InvokeModel resources for the configured model, shared by every
+    // Lambda that calls Bedrock (the analysis worker scores docs; the profile
+    // handler drafts a profile from imported text). See the long note below for
+    // why the GLOBAL profile needs a region wildcard.
+    const isGlobalProfile = BEDROCK_MODEL_ID.startsWith('global.');
+    const isEuProfile = /^eu\./.test(BEDROCK_MODEL_ID);
+    const foundationModelId = BEDROCK_MODEL_ID.replace(/^(global\.|eu\.)/, '');
+    let bedrockResources: string[];
+    if (isGlobalProfile) {
+      // GLOBAL profile routes across the ENTIRE partition and AWS can add
+      // regions without notice → region wildcard `*` on both the
+      // inference-profile ARN and the model-scoped foundation-model ARN. Still
+      // scoped to this ONE model id and the AWS-owned namespace (empty `::`).
+      bedrockResources = [
+        `arn:aws:bedrock:*:${this.account}:inference-profile/${BEDROCK_MODEL_ID}`,
+        `arn:aws:bedrock:*::foundation-model/${foundationModelId}`,
+      ];
+    } else if (isEuProfile) {
+      // EU profile routes across the EU partition only (eu-south-1/2,
+      // eu-west-1/2/3, eu-central-1/2, eu-north-1); a hardcoded list already
+      // omitted eu-south-1 → AccessDenied, so grant the `eu-*` wildcard.
+      bedrockResources = [
+        `arn:aws:bedrock:${this.region}:${this.account}:inference-profile/${BEDROCK_MODEL_ID}`,
+        `arn:aws:bedrock:eu-*::foundation-model/${foundationModelId}`,
+      ];
+    } else {
+      // Plain on-demand model: only the single regional foundation-model ARN.
+      bedrockResources = [`arn:aws:bedrock:${this.region}::foundation-model/${BEDROCK_MODEL_ID}`];
+    }
+    const bedrockInvokePolicy = () =>
+      new iam.PolicyStatement({ actions: ['bedrock:InvokeModel'], resources: bedrockResources });
+
     // Allow Query on the GSIs (L2 grants only cover the base table).
     const grantQueryIndexes = (f: lambda.IFunction, tableName: string) =>
       f.addToRolePolicy(
@@ -167,7 +223,14 @@ export class ApiStack extends cdk.Stack {
     // ── Profile ──────────────────────────────────────────────────────────────
     const profileFn = fn('ProfileFn', 'profile.ts');
     tables.profiles.grantReadWriteData(profileFn);
+    // Reads + writes the per-user token map (store/clear a private-repo token).
+    profileTokens.grantRead(profileFn);
+    profileTokens.grantWrite(profileFn);
+    // Profile import (POST /profile/import) drafts a profile from fetched/pasted
+    // text via one Bedrock call, so this handler also needs InvokeModel.
+    profileFn.addToRolePolicy(bedrockInvokePolicy());
     route([M.GET, M.PUT], '/profile', profileFn);
+    route([M.POST], '/profile/import', profileFn);
 
     // ── Imports (deterministic: batch creation + enqueue analysis) ────────────
     const importsFn = fn('ImportsFn', 'imports.ts');
@@ -178,12 +241,17 @@ export class ApiStack extends cdk.Stack {
     route([M.POST, M.GET], '/imports', importsFn);
     route([M.GET], '/imports/{batchId}', importsFn);
 
-    // ── Documents (read-only library + document detail) ──────────────────────
+    // ── Documents (library + detail reads; reanalyze re-queues) ──────────────
     const documentsFn = fn('DocumentsFn', 'documents.ts');
-    tables.documents.grantReadData(documentsFn);
+    // Reads for library/detail; writes for reanalyze (reset doc to pending,
+    // adjust COUNTS, create a single-document batch, enqueue SQS).
+    tables.documents.grantReadWriteData(documentsFn);
+    tables.batches.grantReadWriteData(documentsFn);
+    analysisQueue.grantSendMessages(documentsFn);
     grantQueryIndexes(documentsFn, tableNames.documents); // GSIs byOwner + byOwnerState
     route([M.GET], '/documents', documentsFn);
-    route([M.GET], '/documents/{documentId}', documentsFn);
+    route([M.GET, M.PATCH, M.DELETE], '/documents/{documentId}', documentsFn);
+    route([M.POST], '/documents/{documentId}/reanalyze', documentsFn);
 
     // ── Analysis worker (SQS-triggered; the ONLY Bedrock/S3 component) ────────
     // Not built via the `fn` helper: it needs a 120s per-document budget
@@ -222,16 +290,12 @@ export class ApiStack extends cdk.Stack {
     tables.batches.grantReadWriteData(analysisWorkerFn);
     tables.profiles.grantReadData(analysisWorkerFn);
     contentBucket.grantReadWrite(analysisWorkerFn);
+    // Worker reads the per-user token map to fetch a private profile source.
+    profileTokens.grantRead(analysisWorkerFn);
     grantQueryIndexes(analysisWorkerFn, tableNames.documents); // GSIs byOwner, byOwnerState
 
-    // Bedrock invoke scoped to the configured foundation model. Foundation
-    // models are account-less, so the ARN omits the account segment.
-    analysisWorkerFn.addToRolePolicy(
-      new iam.PolicyStatement({
-        actions: ['bedrock:InvokeModel'],
-        resources: [`arn:aws:bedrock:${this.region}::foundation-model/${BEDROCK_MODEL_ID}`],
-      })
-    );
+    // Bedrock invoke for the configured model (shared policy, computed above).
+    analysisWorkerFn.addToRolePolicy(bedrockInvokePolicy());
 
     // ── Users (managed via Cognito; ADMIN only except /users/me) ──────────────
     const usersFn = fn('UsersFn', 'users.ts');

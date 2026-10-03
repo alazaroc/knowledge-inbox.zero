@@ -44,10 +44,14 @@ export interface Profile extends Timestamped {
   userId: string;
   highInterests: string[];
   mediumInterests: string[];
-  currentlyResearching: string[];
+  currentlyResearching: string[]; // active research/investigation
   alreadyKnown: string[]; // topics/concepts the user already knows
   avoidContentTypes: string[];
-  context?: string; // free text, <=5000 chars trimmed
+  activeContexts: string[]; // active initiatives/projects (distinct from research)
+  context?: string; // free text "About you", <=2000 chars trimmed
+  profileSourceUrl?: string; // optional public raw URL of the user's own profile.md
+  profileRepoUrl?: string; // optional PRIVATE repo raw URL (token lives in Secrets Manager)
+  hasToken?: boolean; // true when a private-repo token is stored for this user (read-only flag)
   notConfigured?: boolean; // true only for the synthetic empty profile (Req 1.4)
 }
 
@@ -67,6 +71,7 @@ export interface DocMetadata {
   author?: string;
   sourceDomain?: string;
   publishedAt?: string; // ISO date if found
+  imageUrl?: string; // og:image / twitter:image — the page's own share thumbnail
 }
 
 // Structured LLM extraction of a document's content.
@@ -77,6 +82,7 @@ export interface Extraction {
   difficulty: Difficulty;
   summary: string; // <=500 chars
   truncated?: boolean; // Req 4.6
+  wordCount?: number; // word count of the extracted readable text (reading-time source)
 }
 
 // One analyzed document per canonical URL per owner.
@@ -97,12 +103,34 @@ export interface KnowledgeDocument extends Timestamped {
   explanation?: string; // 50..1500 chars, or placeholder (Req 6.6)
   explanationUnavailable?: boolean; // Req 6.6
   s3ContentRef?: string; // set when raw content >300KB (Req 4.7)
+  archived?: boolean; // user lifecycle: archived documents are hidden by default
+  userFeedback?: 'up' | 'down'; // user's thumbs up/down on the classification (signal only)
+  readingMinutes?: number; // estimated reading time in minutes (from Extraction.wordCount)
 }
 
 // A rejected import line and why it was rejected (Req 2.4).
 export interface RejectedEntry {
   line: string;
   reason: string;
+}
+
+// Response of POST /imports. Beyond the created batch counts it reports the
+// daily-quota outcome so the UI can show a hard-block message plus the exact
+// URLs that were NOT processed (so the user can save them and retry tomorrow).
+export interface ImportResult {
+  batchId: string;
+  total: number; // new docs enqueued + rejected (this batch)
+  pending: number; // new docs enqueued
+  rejected: RejectedEntry[]; // invalid URLs
+  // Daily cost-control quota (USER role; ADMIN is unlimited → limit is null).
+  dailyLimit: number | null;
+  usedToday: number; // new docs enqueued today BEFORE this batch
+  remaining: number | null; // null when unlimited
+  // URLs accepted-as-valid but NOT enqueued because the daily limit was hit.
+  // The user can copy these and retry the next day.
+  blocked: string[];
+  // URLs accepted that reused an existing document (duplicates); omitted when 0.
+  duplicates?: number;
 }
 
 // An import batch with atomic progress counters (CP-10).

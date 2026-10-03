@@ -4,14 +4,14 @@
 # Run it once after deploying (or when the User Pool / API change).
 # Then `make dev` starts the frontend reading that .env, no AWS needed.
 #
-# Usage (default environment: test):
+# Usage (default environment: prod):
 #   ./scripts/dev-frontend.sh        # = make dev-env
 #   ENV=prod ./scripts/dev-frontend.sh
 
 set -euo pipefail
 
-ENV=${ENV:-test}
-PROJECT={{PROJECT_NAME}}
+ENV=${ENV:-prod}
+PROJECT=knowledge-inbox-zero
 OUT=frontend/.env
 
 echo "→ Resolving '$ENV' endpoints from SSM"

@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
-import { Link, useParams } from 'react-router-dom';
+import { Link, useNavigate, useParams } from 'react-router-dom';
+import { Archive, ArchiveRestore, ThumbsDown, ThumbsUp, Trash2 } from 'lucide-react';
 import type {
   KnowledgeDocument,
   RecommendationState,
@@ -38,6 +39,7 @@ const SCORE_FIELDS: { key: keyof Scores; label: string; hint: string }[] = [
 export default function DocumentDetailPage() {
   // Route is /app/library/:documentId (registered in App.tsx by the routing agent).
   const { documentId } = useParams<{ documentId: string }>();
+  const navigate = useNavigate();
   // Reading the session keeps the shared api client authenticated (Req 8.12);
   // the client attaches the token and handles retry/backoff on its own.
   useAuth();
@@ -45,6 +47,11 @@ export default function DocumentDetailPage() {
   const [doc, setDoc] = useState<KnowledgeDocument | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
+  const [reanalyzing, setReanalyzing] = useState(false);
+  const [reanalyzeError, setReanalyzeError] = useState('');
+  // In-flight lifecycle (archive/delete) and feedback actions.
+  const [lifecycleBusy, setLifecycleBusy] = useState(false);
+  const [feedbackBusy, setFeedbackBusy] = useState(false);
 
   const load = async () => {
     if (!documentId) {
@@ -64,11 +71,90 @@ export default function DocumentDetailPage() {
     }
   };
 
+  // Re-queue this document for a fresh analysis against the CURRENT profile,
+  // then poll until the new run lands (status leaves pending/processing).
+  const handleReanalyze = async () => {
+    if (!documentId || reanalyzing) return;
+    setReanalyzing(true);
+    setReanalyzeError('');
+    try {
+      await api.post(`/documents/${documentId}/reanalyze`, {});
+      // Poll the document until it finishes re-processing (≤ ~45s).
+      for (let i = 0; i < 15; i++) {
+        await new Promise((r) => setTimeout(r, 3000));
+        const fresh = await api.get<KnowledgeDocument>(`/documents/${documentId}`);
+        if (fresh.status !== 'pending' && fresh.status !== 'processing') {
+          setDoc(fresh);
+          return;
+        }
+      }
+      // Timed out polling — refresh once so the user sees the latest state.
+      await load();
+    } catch (err) {
+      setReanalyzeError((err as Error).message);
+    } finally {
+      setReanalyzing(false);
+    }
+  };
+
   useEffect(() => {
     // Reload whenever the document id in the route changes.
     void load();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [documentId]);
+
+  // Toggle archived state via PATCH; archiving does not change owner-wide counts.
+  const handleToggleArchive = async () => {
+    if (!documentId || !doc || lifecycleBusy) return;
+    setLifecycleBusy(true);
+    setError('');
+    try {
+      const updated = await api.patch<KnowledgeDocument>(`/documents/${documentId}`, {
+        archived: !doc.archived,
+      });
+      setDoc(updated);
+    } catch (err) {
+      setError((err as Error).message || 'Failed to update the document.');
+    } finally {
+      setLifecycleBusy(false);
+    }
+  };
+
+  // Hard delete with confirmation; the backend decrements owner-wide counts.
+  const handleDelete = async () => {
+    if (!documentId || lifecycleBusy) return;
+    const ok = window.confirm(
+      'This permanently deletes the document. You may re-import it later. Continue?'
+    );
+    if (!ok) return;
+    setLifecycleBusy(true);
+    setError('');
+    try {
+      await api.delete(`/documents/${documentId}`);
+      navigate('/app/library');
+    } catch (err) {
+      setError((err as Error).message || 'Failed to delete the document.');
+      setLifecycleBusy(false);
+    }
+  };
+
+  // Thumbs up/down on the classification. Clicking the active rating again
+  // clears it (sends null). Signal only — does not change counts.
+  const handleFeedback = async (value: 'up' | 'down') => {
+    if (!documentId || !doc || feedbackBusy) return;
+    const next = doc.userFeedback === value ? null : value;
+    setFeedbackBusy(true);
+    try {
+      const updated = await api.patch<KnowledgeDocument>(`/documents/${documentId}`, {
+        userFeedback: next,
+      });
+      setDoc(updated);
+    } catch (err) {
+      setError((err as Error).message || 'Failed to save your feedback.');
+    } finally {
+      setFeedbackBusy(false);
+    }
+  };
 
   const title = doc?.metadata?.title?.trim() || doc?.canonicalUrl || doc?.rawUrl || 'Document';
 
@@ -81,7 +167,57 @@ export default function DocumentDetailPage() {
         >
           ← Back to library
         </Link>
+        {doc && (
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={() => void handleToggleArchive()}
+              disabled={lifecycleBusy}
+              title={doc.archived ? 'Unarchive this document' : 'Archive this document'}
+              className="inline-flex items-center gap-1.5 rounded-md border border-gray-200 bg-white px-3 py-1.5 text-sm font-medium text-gray-600 hover:bg-gray-50 disabled:cursor-not-allowed disabled:opacity-60"
+            >
+              {doc.archived ? (
+                <>
+                  <ArchiveRestore className="h-4 w-4" /> Unarchive
+                </>
+              ) : (
+                <>
+                  <Archive className="h-4 w-4" /> Archive
+                </>
+              )}
+            </button>
+            <button
+              type="button"
+              onClick={() => void handleDelete()}
+              disabled={lifecycleBusy}
+              title="Delete this document permanently"
+              className="inline-flex items-center gap-1.5 rounded-md border border-red-200 bg-white px-3 py-1.5 text-sm font-medium text-red-600 hover:bg-red-50 disabled:cursor-not-allowed disabled:opacity-60"
+            >
+              <Trash2 className="h-4 w-4" /> Delete
+            </button>
+            <button
+              type="button"
+              onClick={() => void handleReanalyze()}
+              disabled={reanalyzing}
+              title="Re-score this document against your current profile"
+              className="inline-flex items-center gap-2 rounded-md border border-indigo-200 bg-white px-3 py-1.5 text-sm font-medium text-indigo-700 hover:bg-indigo-50 disabled:cursor-not-allowed disabled:opacity-60"
+            >
+              {reanalyzing ? 'Re-analyzing…' : 'Re-analyze'}
+            </button>
+          </div>
+        )}
       </div>
+
+      {reanalyzing && (
+        <p className="rounded-md bg-indigo-50 px-4 py-2 text-sm text-indigo-800">
+          Re-analyzing against your current profile — this takes a few seconds.
+        </p>
+      )}
+      {reanalyzeError && (
+        <p className="rounded-md bg-red-50 px-4 py-2 text-sm text-red-700">
+          Couldn&apos;t re-analyze: {reanalyzeError}
+        </p>
+      )}
 
       {loading ? (
         <p className="text-sm text-gray-500">Loading…</p>
@@ -121,6 +257,29 @@ export default function DocumentDetailPage() {
             >
               {doc.canonicalUrl || doc.rawUrl}
             </a>
+
+            {/* Share image (og:image) when the page exposed one. Clicking opens
+                the source. Hidden on load error so a dead image leaves no gap. */}
+            {doc.metadata?.imageUrl && (
+              <a
+                href={doc.canonicalUrl || doc.rawUrl}
+                target="_blank"
+                rel="noreferrer"
+                className="block"
+              >
+                <img
+                  src={doc.metadata.imageUrl}
+                  alt=""
+                  loading="lazy"
+                  referrerPolicy="no-referrer"
+                  onError={(e) => {
+                    const el = e.currentTarget.parentElement;
+                    if (el) el.style.display = 'none';
+                  }}
+                  className="max-h-72 w-full rounded-lg border border-gray-200 object-cover"
+                />
+              </a>
+            )}
 
             <div className="flex flex-wrap items-center gap-2">
               {doc.recommendationState && (
@@ -171,7 +330,43 @@ export default function DocumentDetailPage() {
             )}
           </section>
 
-          {/* What the content says — summary and key claims from the extraction (Req 8.9). */}
+          {/* Feedback (Level 1 — collect signal only). Lets the user mark
+              whether the classification was accurate. */}
+          <section className="flex flex-wrap items-center gap-3 rounded-lg border border-gray-200 bg-white px-5 py-3">
+            <span className="text-sm font-medium text-gray-700">
+              Was this classification helpful?
+            </span>
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={() => void handleFeedback('up')}
+                disabled={feedbackBusy}
+                aria-pressed={doc.userFeedback === 'up'}
+                title="Yes, this was accurate"
+                className={`inline-flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-sm font-medium transition disabled:opacity-60 ${
+                  doc.userFeedback === 'up'
+                    ? 'border-emerald-300 bg-emerald-50 text-emerald-700'
+                    : 'border-gray-200 bg-white text-gray-600 hover:bg-gray-50'
+                }`}
+              >
+                <ThumbsUp className="h-4 w-4" /> Yes
+              </button>
+              <button
+                type="button"
+                onClick={() => void handleFeedback('down')}
+                disabled={feedbackBusy}
+                aria-pressed={doc.userFeedback === 'down'}
+                title="No, this was off"
+                className={`inline-flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-sm font-medium transition disabled:opacity-60 ${
+                  doc.userFeedback === 'down'
+                    ? 'border-rose-300 bg-rose-50 text-rose-700'
+                    : 'border-gray-200 bg-white text-gray-600 hover:bg-gray-50'
+                }`}
+              >
+                <ThumbsDown className="h-4 w-4" /> No
+              </button>
+            </div>
+          </section>
           {doc.extraction && (
             <section className="space-y-4 rounded-lg border border-gray-200 bg-white p-5">
               <h2 className="text-sm font-semibold text-gray-900">What the content says</h2>

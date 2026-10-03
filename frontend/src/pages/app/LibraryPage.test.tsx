@@ -10,6 +10,7 @@ vi.mock('../../lib/api', () => ({
     get: vi.fn(),
     post: vi.fn(),
     put: vi.fn(),
+    patch: vi.fn(),
     delete: vi.fn(),
   },
 }));
@@ -87,8 +88,8 @@ describe('LibraryPage', () => {
 
     renderPage();
 
-    // While pending, the loading text is visible and no empty state yet.
-    expect(screen.getByText(/loading your library/i)).toBeInTheDocument();
+    // While pending, the loading skeleton is visible and no empty state yet.
+    expect(screen.getByLabelText(/loading your library/i)).toBeInTheDocument();
     expect(screen.queryByText('No documents yet')).not.toBeInTheDocument();
 
     // Resolve so the pending promise doesn't leak into later assertions.

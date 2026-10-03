@@ -53,7 +53,7 @@ API Gateway HTTP API v2  ──(JWT authorizer)──►  Lambdas (Node 22, ARM6
 - **Infra** (`infra/cdk`): AWS CDK (`aws-cdk-lib` ^2.258) — `storage` (DynamoDB + content bucket), `auth` (Cognito + TOTP MFA), `api` (HTTP API v2 + Lambdas + SQS/DLQ + Bedrock IAM), `frontend` (private S3 + CloudFront with OAC and security headers).
 - **Quality**: ESLint 9, Prettier, Stylelint, husky + lint-staged, Jest (backend, with `fast-check` property tests), Vitest (frontend). CI pipeline via GitHub Actions + OIDC.
 
-Default region `eu-south-2` (configurable). Environments: `test` and `prod`.
+Default region `eu-south-2` (configurable). Environment: `prod` (the `test` environment is retired for now).
 
 ## Project layout
 
@@ -70,6 +70,10 @@ Default region `eu-south-2` (configurable). Environments: `test` and `prod`.
 
 ## Getting started
 
+> **New here?** [INSTALL.md](INSTALL.md) walks through both ways to use the app:
+> using the hosted web app (zero setup), or self-hosting on your own AWS account.
+> This section is the quick reference.
+
 Prerequisites: Node.js ≥ 22, an AWS account, the AWS CLI configured, and the AWS CDK bootstrapped in your account/region. Amazon Bedrock model access must be enabled for the configured model.
 
 ```bash
@@ -81,8 +85,8 @@ make build                           # build shared + backend + frontend
 
 ```bash
 cdk bootstrap aws://<account>/<region>              # once per account/region
-make deploy ENV=test                                # storage + auth + api + frontend
-make create-admin EMAIL=you@email.com PASSWORD='Temp.123!' ENV=test
+make deploy ENV=prod                                # storage + auth + api + frontend
+make create-admin EMAIL=you@email.com PASSWORD='Temp.123!' ENV=prod
 ```
 
 On first login Cognito requires changing the password and setting up TOTP MFA. User creation is invite-only.
@@ -104,9 +108,9 @@ make test                            # backend (Jest) + frontend (Vitest)
 make fix                             # auto-fix lint + css + formatting
 make typecheck                       # type-check all workspaces
 
-make deploy ENV=test                 # infra + frontend (skips unchanged components)
-make deploy-backend ENV=test         # CDK only
-make deploy-frontend ENV=test        # build + S3 sync + CloudFront invalidation
+make deploy ENV=prod                 # infra + frontend (skips unchanged components)
+make deploy-backend ENV=prod         # CDK only
+make deploy-frontend ENV=prod        # build + S3 sync + CloudFront invalidation
 make deploy ENV=prod FORCE_DEPLOY=true
 
 make logs-lambdas ENV=test TYPE=errors   # tail Lambda logs (MINS=30 default)
@@ -126,7 +130,7 @@ make set-password EMAIL=x@email.com PASSWORD='New.Secure123!' ENV=test
 
 - `BEDROCK_MODEL_ID` — the Bedrock foundation model (set at deploy time; a redeploy switches models without code changes).
 - `EMBEDDINGS_ENABLED` — Tier B semantic novelty via embeddings; defaults to `false`. V1 uses the deterministic concept-based path.
-- `{{PROJECT_NAME}}` and `{{AWS_REGION}}` — repo-wide placeholders for your project slug and AWS region. (Internal `@app/*` package names are fixed and not renamed.)
+- `knowledge-inbox-zero` and `eu-south-2` — repo-wide placeholders for your project slug and AWS region. (Internal `@app/*` package names are fixed and not renamed.)
 
 ## CI/CD
 

@@ -5,13 +5,13 @@
 # or to skip the email reset flow. After this the user is CONFIRMED and the
 # next login goes straight to TOTP MFA.
 #
-# Usage (default environment: test):
+# Usage (default environment: prod):
 #   ./scripts/set-password.sh email@example.com 'New.Secure123!'
 
 set -euo pipefail
 
-ENV=${ENV:-test}
-PROJECT={{PROJECT_NAME}}
+ENV=${ENV:-prod}
+PROJECT=knowledge-inbox-zero
 
 EMAIL=${1:?Missing EMAIL}
 PASSWORD=${2:?Missing PASSWORD (min 12 chars: upper, lower, digits and symbols)}

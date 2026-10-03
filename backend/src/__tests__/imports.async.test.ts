@@ -156,11 +156,12 @@ describe('imports handler — async boundary (Req 3.1, NFR-2)', () => {
     const sqsArg = sqsSend.mock.calls[0][0];
     expect(sqsArg).toBeInstanceOf(SendMessageBatchCommand);
 
-    // (2) The only AWS commands issued are DynamoDB Get/Put (and Query is not
-    //     used on the create path). No analysis-time command appears.
+    // (2) The only AWS commands issued are DynamoDB Get/Put/Update (the Update
+    //     is the daily-quota counter). Query is not used on the create path,
+    //     and no analysis-time command appears.
     const names = ddbCommandNames();
     expect(names.length).toBeGreaterThan(0);
-    const allowed = new Set(['GetCommand', 'PutCommand']);
+    const allowed = new Set(['GetCommand', 'PutCommand', 'UpdateCommand']);
     for (const n of names) {
       expect(allowed.has(n)).toBe(true);
     }

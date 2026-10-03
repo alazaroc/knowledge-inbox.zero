@@ -1,12 +1,14 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# {{PROJECT_NAME}} — Makefile
+# knowledge-inbox-zero — Makefile
 # Thin wrappers over the npm scripts and the scripts/ helpers.
-# Environments: test | prod.  Overridable variables:  make deploy ENV=prod FORCE_DEPLOY=true
+# Environments: test | prod.  Default is prod (test env retired for now).
+# Overridable variables:  make deploy ENV=prod FORCE_DEPLOY=true
 # ─────────────────────────────────────────────────────────────────────────────
 
-PROJECT      := {{PROJECT_NAME}}
-REGION       ?= {{AWS_REGION}}
-ENV          ?= test
+PROJECT      := knowledge-inbox-zero
+REGION       ?= eu-south-2
+PROFILE      ?= webs
+ENV          ?= prod
 FORCE_DEPLOY ?= false
 
 # create-user / create-admin (create-user.sh uses positional args: EMAIL PASSWORD ROLE)
@@ -99,15 +101,15 @@ validate:
 
 ## deploy: deploy everything (infra + frontend)
 deploy:
-	ENV=$(ENV) FORCE_DEPLOY=$(FORCE_DEPLOY) ./scripts/deploy.sh
+	AWS_PROFILE=$(PROFILE) AWS_REGION=$(REGION) ENV=$(ENV) FORCE_DEPLOY=$(FORCE_DEPLOY) ./scripts/deploy.sh
 
 ## deploy-backend: deploy backend+infra only (CDK)
 deploy-backend:
-	ENV=$(ENV) FORCE_DEPLOY=$(FORCE_DEPLOY) ./scripts/deploy.sh backend
+	AWS_PROFILE=$(PROFILE) AWS_REGION=$(REGION) ENV=$(ENV) FORCE_DEPLOY=$(FORCE_DEPLOY) ./scripts/deploy.sh backend
 
 ## deploy-frontend: deploy frontend only (build + S3 sync + invalidation)
 deploy-frontend:
-	ENV=$(ENV) FORCE_DEPLOY=$(FORCE_DEPLOY) ./scripts/deploy.sh frontend
+	AWS_PROFILE=$(PROFILE) AWS_REGION=$(REGION) ENV=$(ENV) FORCE_DEPLOY=$(FORCE_DEPLOY) ./scripts/deploy.sh frontend
 
 # ── Users (Cognito) ──────────────────────────────────────────────────────────
 

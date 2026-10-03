@@ -3,6 +3,7 @@ export interface NamingConfig {
   environment: string;
   account?: string;
   version: string;
+  repository: string;
 }
 
 export class ResourceNaming {
@@ -34,6 +35,7 @@ export class ResourceNaming {
       project: this.config.project,
       environment: this.config.environment,
       version: this.config.version,
+      repository: this.config.repository,
     };
   }
 

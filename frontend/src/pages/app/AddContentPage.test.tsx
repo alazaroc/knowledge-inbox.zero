@@ -8,6 +8,7 @@ vi.mock('../../lib/api', () => ({
     get: vi.fn(),
     post: vi.fn(),
     put: vi.fn(),
+    patch: vi.fn(),
     delete: vi.fn(),
   },
 }));
@@ -74,6 +75,11 @@ describe('AddContentPage polling', () => {
       total: 1,
       pending: 1,
       rejected: [],
+      dailyLimit: 50,
+      usedToday: 0,
+      remaining: 49,
+      blocked: [],
+      duplicates: 0,
     });
     // First poll: still processing. Second poll: finished (terminal).
     mockGet.mockResolvedValueOnce(processingBatch).mockResolvedValueOnce(finishedBatch);

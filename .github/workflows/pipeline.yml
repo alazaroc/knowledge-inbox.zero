@@ -12,7 +12,7 @@ permissions:
   contents: read
 
 env:
-  AWS_REGION: "{{AWS_REGION}}"
+  AWS_REGION: "eu-south-2"
   CI: true
 
 concurrency:
@@ -88,7 +88,7 @@ jobs:
       - name: CDK synth (validate infrastructure)
         run: |
           cd infra/cdk
-          npx cdk synth --context env=test --quiet
+          npx cdk synth --context env=prod --quiet
         env:
           CDK_DEFAULT_ACCOUNT: "000000000000"
           # Region is irrelevant for a compile-only synth; pin a valid one so
@@ -101,48 +101,50 @@ jobs:
   # ─────────────────────────────────────────────────────────────
   # CD · Deploy to TEST (non-main branches, push only)
   # ─────────────────────────────────────────────────────────────
-  deploy-test:
-    name: Deploy (test)
-    runs-on: ubuntu-latest
-    needs: [build]
-    # Skipped (not failed) until AWS_ROLE_FOR_GITHUB_DEPLOYMENTS is configured, so the
-    # untouched template repo stays green. Set the variable to enable deploys.
-    if: github.ref != 'refs/heads/main' && github.event_name == 'push' && vars.AWS_ROLE_FOR_GITHUB_DEPLOYMENTS != ''
-    environment:
-      name: test
-    env:
-      AWS_ROLE: ${{ vars.AWS_ROLE_FOR_GITHUB_DEPLOYMENTS }}
-    steps:
-      - uses: actions/checkout@v7
-      - name: Validate required variables
-        run: |
-          set -e
-          if [[ -z "${AWS_ROLE}" ]]; then
-            echo "Missing required variable: AWS_ROLE (vars.AWS_ROLE_FOR_GITHUB_DEPLOYMENTS)"
-            exit 1
-          fi
-          echo "Environment OK."
-      - name: Setup Node.js
-        uses: actions/setup-node@v7
-        with:
-          node-version: "22"
-          cache: "npm"
-      - name: Install dependencies
-        run: npm ci
-      - name: Configure AWS credentials (OIDC)
-        uses: aws-actions/configure-aws-credentials@v6
-        with:
-          role-to-assume: ${{ env.AWS_ROLE }}
-          aws-region: ${{ env.AWS_REGION }}
-      - name: Cache deployment hashes
-        uses: actions/cache@v6
-        with:
-          path: .deploy-hashes/
-          key: deploy-test-${{ github.sha }}
-          restore-keys: |
-            deploy-test-
-      - name: Deploy to TEST environment
-        run: ENV=test bash scripts/deploy.sh all
+  # DISABLED — the test environment is retired for now (prod-only).
+  # Re-enable by uncommenting this whole job if a test environment is reintroduced.
+  # deploy-test:
+  #   name: Deploy (test)
+  #   runs-on: ubuntu-latest
+  #   needs: [build]
+  #   # Skipped (not failed) until AWS_ROLE_FOR_GITHUB_DEPLOYMENTS is configured, so the
+  #   # untouched template repo stays green. Set the variable to enable deploys.
+  #   if: github.ref != 'refs/heads/main' && github.event_name == 'push' && vars.AWS_ROLE_FOR_GITHUB_DEPLOYMENTS != ''
+  #   environment:
+  #     name: test
+  #   env:
+  #     AWS_ROLE: ${{ vars.AWS_ROLE_FOR_GITHUB_DEPLOYMENTS }}
+  #   steps:
+  #     - uses: actions/checkout@v7
+  #     - name: Validate required variables
+  #       run: |
+  #         set -e
+  #         if [[ -z "${AWS_ROLE}" ]]; then
+  #           echo "Missing required variable: AWS_ROLE (vars.AWS_ROLE_FOR_GITHUB_DEPLOYMENTS)"
+  #           exit 1
+  #         fi
+  #         echo "Environment OK."
+  #     - name: Setup Node.js
+  #       uses: actions/setup-node@v7
+  #       with:
+  #         node-version: "22"
+  #         cache: "npm"
+  #     - name: Install dependencies
+  #       run: npm ci
+  #     - name: Configure AWS credentials (OIDC)
+  #       uses: aws-actions/configure-aws-credentials@v6
+  #       with:
+  #         role-to-assume: ${{ env.AWS_ROLE }}
+  #         aws-region: ${{ env.AWS_REGION }}
+  #     - name: Cache deployment hashes
+  #       uses: actions/cache@v6
+  #       with:
+  #         path: .deploy-hashes/
+  #         key: deploy-test-${{ github.sha }}
+  #         restore-keys: |
+  #           deploy-test-
+  #     - name: Deploy to TEST environment
+  #       run: ENV=test bash scripts/deploy.sh all
 
   # ─────────────────────────────────────────────────────────────
   # CD · Deploy to PROD (main only)

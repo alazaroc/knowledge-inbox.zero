@@ -17,17 +17,16 @@
     "@aws-sdk/client-cognito-identity-provider": "^3.1068.0",
     "@aws-sdk/client-dynamodb": "^3.1066.0",
     "@aws-sdk/client-s3": "3.1066.0",
+    "@aws-sdk/client-secrets-manager": "3.1066.0",
     "@aws-sdk/client-sqs": "3.1066.0",
     "@aws-sdk/lib-dynamodb": "^3.1066.0",
-    "@mozilla/readability": "0.6.0",
     "aws-jwt-verify": "^5.2.1",
-    "jsdom": "29.1.1",
+    "cheerio": "^1.2.0",
     "zod": "^3.22.0"
   },
   "devDependencies": {
     "@types/aws-lambda": "^8.10.0",
     "@types/jest": "^29.0.0",
-    "@types/jsdom": "30.0.0",
     "@types/node": "^20.0.0",
     "eslint": "^9.39.4",
     "eslint-config-prettier": "^10.1.8",
@@ -37,16 +36,5 @@
     "ts-jest": "^29.0.0",
     "typescript": "^5.4.0",
     "typescript-eslint": "^8.59.0"
-  },
-  "jest": {
-    "preset": "ts-jest",
-    "testEnvironment": "node",
-    "testMatch": [
-      "**/__tests__/**/*.test.ts"
-    ],
-    "moduleNameMapper": {
-      "^@app/shared$": "<rootDir>/../shared/src/index.ts",
-      "^(\\.{1,2}/.*)\\.js$": "$1"
-    }
   }
 }

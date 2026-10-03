@@ -30,10 +30,11 @@ function sanitizeProject(raw: string): string {
 }
 
 const naming = new ResourceNaming({
-  project: sanitizeProject('{{PROJECT_NAME}}'),
+  project: sanitizeProject('knowledge-inbox-zero'),
   environment: env,
   account,
   version: '0.1.0',
+  repository: 'https://github.com/alazaroc/knowledge-inbox-zero',
 });
 
 const stackEnv = { account, region };
@@ -65,7 +66,11 @@ const frontendStack = new FrontendStack(app, naming.standard('frontend'), {
   env: stackEnv,
   naming,
   tags: naming.withType('frontend'),
-  // To use a custom domain, pass domainName and certificateArn here (ACM in us-east-1).
+  // Custom domain is opt-in via context (keeps the template portable — nobody
+  // inherits a domain they didn't set): pass -c domainName=... and
+  // -c certificateArn=... (the ACM cert MUST be in us-east-1 for CloudFront).
+  domainName: app.node.tryGetContext('domainName') || undefined,
+  certificateArn: app.node.tryGetContext('certificateArn') || undefined,
   description: 'S3 bucket (static site) and CloudFront distribution with OAC.',
 });
 frontendStack.addDependency(apiStack);

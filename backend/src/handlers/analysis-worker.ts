@@ -21,7 +21,8 @@ import {
 } from '@app/shared';
 import { ddb } from '../lib/dynamo.js';
 import { retrieveReadable } from '../lib/retrieve.js';
-import { bedrockExtract, bedrockExplain } from '../lib/bedrock.js';
+import { getUserToken } from '../lib/profile-tokens.js';
+import { bedrockExtract, bedrockExplain, bedrockScore } from '../lib/bedrock.js';
 import { now } from '../lib/ids.js';
 
 /**
@@ -51,8 +52,17 @@ const S3_OFFLOAD_THRESHOLD = 300_000;
 // Minimum acceptable explanation length; shorter → placeholder (Req 6.6).
 const MIN_EXPLANATION_CHARS = 50;
 
+// Reading-time estimate: average adult reading speed, minimum one minute.
+const WORDS_PER_MINUTE = 225;
+
 const EXPLANATION_PLACEHOLDER =
   'Explanation unavailable; recommendation and scores were still computed.';
+
+// "Bring your own" profile source: when the profile carries a public raw URL,
+// the worker fetches it at analysis time and uses its text as the profile
+// context, WITHOUT persisting the fetched content (only the URL is stored).
+const PROFILE_FETCH_TIMEOUT_MS = 10_000;
+const PROFILE_FETCH_MAX_CHARS = 20_000;
 
 const s3 = new S3Client({});
 const contentBucket = () => process.env.CONTENT_BUCKET ?? '';
@@ -135,10 +145,23 @@ async function processDocument(msg: AnalysisMessage): Promise<void> {
     // 3. Retrieve + extract readable content (15s bounded fetch inside).
     const got = await retrieveReadable(doc.canonicalUrl);
     let degraded = got.degraded;
+    let degradedReason = got.reason;
     let s3ContentRef: string | undefined;
+
+    console.log(
+      JSON.stringify({
+        stage: 'retrieve',
+        documentId: msg.documentId,
+        url: doc.canonicalUrl,
+        degraded: got.degraded,
+        reason: got.reason,
+        textLen: got.text?.length ?? 0,
+      })
+    );
 
     // 4. Structured extraction (only when we have readable text).
     let extraction: Extraction | undefined;
+    let readingMinutes: number | undefined;
     if (got.text) {
       let text = got.text;
       let truncated = false;
@@ -147,13 +170,30 @@ async function processDocument(msg: AnalysisMessage): Promise<void> {
         truncated = true;
       }
 
+      // Reading time from the FULL readable text (before truncation), ~225 wpm,
+      // at least 1 minute. Only set when there is text; degraded docs stay unset.
+      const wordCount = got.text.split(/\s+/).filter(Boolean).length;
+      readingMinutes =
+        wordCount > 0 ? Math.max(1, Math.round(wordCount / WORDS_PER_MINUTE)) : undefined;
+
       try {
         const extracted = await bedrockExtract({ text });
-        extraction = { ...extracted, truncated };
-      } catch {
+        extraction = { ...extracted, truncated, wordCount };
+      } catch (err) {
         // Bounded retries already exhausted inside bedrockExtract → degrade.
+        // Keep the real reason so it is persisted and visible for triage
+        // instead of being silently lost.
         degraded = true;
+        degradedReason = `extract_failed: ${reasonOf(err)}`;
         extraction = undefined;
+        console.error(
+          JSON.stringify({
+            stage: 'extract',
+            documentId: msg.documentId,
+            url: doc.canonicalUrl,
+            reason: degradedReason,
+          })
+        );
       }
 
       // Req 4.7: offload large raw content to S3; store only the reference.
@@ -165,16 +205,70 @@ async function processDocument(msg: AnalysisMessage): Promise<void> {
       }
     }
 
-    // 5. Deterministic scoring (metadata-only when degraded — still a rec, Req 4.5).
+    // 5. Scoring. Resolve the EFFECTIVE profile ("bring your own": fetch the
+    // public URL at analysis time without persisting it), then score the doc
+    // SEMANTICALLY with the LLM. Freshness + MKV stay deterministic.
     const nowDate = new Date();
-    const { scores, freshnessEstimated } = scoreDocument({
-      extraction,
-      profile,
-      priorConcepts,
+    const effectiveProfile = await resolveEffectiveProfile(profile);
+
+    const freshness = computeFreshness({
+      docConcepts: new Set(),
+      docTopics: new Set(),
+      interests: new Set(),
+      known: new Set(),
       publishedAt: got.metadata.publishedAt,
-      isDup,
       now: nowDate,
+      isExactPriorDuplicate: isDup,
     });
+    const freshnessEstimated = !got.metadata.publishedAt; // Req 5.9
+
+    let scores: Scores;
+    let scoreReasoning: string | undefined;
+    let scoringFallbackReason: string | undefined;
+
+    if (extraction) {
+      try {
+        // PRIMARY: semantic LLM scoring against the full rich profile.
+        const llm = await bedrockScore({ extraction, profile: effectiveProfile });
+        const base: Scores = {
+          relevance: llm.relevance,
+          novelty: llm.novelty,
+          redundancy: llm.redundancy,
+          freshness,
+          mkv: 0,
+        };
+        scores = { ...base, mkv: computeMkv(base) };
+        scoreReasoning = llm.reasoning;
+      } catch (err) {
+        // FALLBACK: deterministic string-match scorer (kept in @app/shared).
+        scoringFallbackReason = `llm_scoring_failed: ${reasonOf(err)}`;
+        console.error(
+          JSON.stringify({
+            stage: 'score',
+            documentId: msg.documentId,
+            reason: scoringFallbackReason,
+          })
+        );
+        scores = deterministicScores({
+          extraction,
+          profile: effectiveProfile,
+          priorConcepts,
+          freshness,
+          isDup,
+          now: nowDate,
+        });
+      }
+    } else {
+      // Degraded (no extraction): deterministic metadata-only scoring (Req 4.5).
+      scores = deterministicScores({
+        extraction,
+        profile: effectiveProfile,
+        priorConcepts,
+        freshness,
+        isDup,
+        now: nowDate,
+      });
+    }
 
     // 6. Single recommendation state + advisory tags.
     const { state, tags } = scoresToRecommendationState(scores, {
@@ -183,12 +277,30 @@ async function processDocument(msg: AnalysisMessage): Promise<void> {
       now: nowDate,
     });
 
-    // 7. Written explanation with placeholder fallback (Req 6.6).
+    // 7. Explanation. Prefer the LLM scoring reasoning (why it matters for this
+    // user). When present we never leave "explanation unavailable" since the
+    // score WAS computed. Otherwise write a dedicated explanation; last resort
+    // is the placeholder (Req 6.6).
+    //
+    // Token-cost control: for DISCARDED documents (state SKIP — low marginal
+    // value / below the recommendation threshold) we do NOT spend a dedicated
+    // bedrockExplain call when there is no scoring reasoning to reuse; the
+    // placeholder is sufficient for something the user is told to skip. This
+    // saves ~1/3 of the per-document LLM calls on low-signal docs.
     let explanation = EXPLANATION_PLACEHOLDER;
     let explanationUnavailable = true;
-    if (extraction) {
+    if (scoreReasoning && scoreReasoning.trim().length >= MIN_EXPLANATION_CHARS) {
+      explanation = scoreReasoning.trim();
+      explanationUnavailable = false;
+    } else if (extraction && state !== 'SKIP') {
       try {
-        const written = await bedrockExplain({ extraction, scores, state, profile, tags });
+        const written = await bedrockExplain({
+          extraction,
+          scores,
+          state,
+          profile: effectiveProfile,
+          tags,
+        });
         if (written.trim().length >= MIN_EXPLANATION_CHARS) {
           explanation = written.trim();
           explanationUnavailable = false;
@@ -202,6 +314,10 @@ async function processDocument(msg: AnalysisMessage): Promise<void> {
       ? { ...scores, freshnessEstimated: true } // Req 5.9
       : scores;
 
+    // Record a non-fatal scoring fallback as the failure reason when the doc
+    // was otherwise fine (not degraded), so the reason is visible for triage.
+    const failureReason = degraded ? degradedReason : scoringFallbackReason;
+
     // 8. Persist the completed analysis, then move counters + bump aggregate.
     await persistCompleted(msg, {
       metadata: got.metadata,
@@ -212,8 +328,9 @@ async function processDocument(msg: AnalysisMessage): Promise<void> {
       explanation,
       explanationUnavailable,
       degraded,
-      failureReason: degraded ? got.reason : undefined,
+      failureReason,
       s3ContentRef,
+      readingMinutes,
     });
     await moveCounters(msg.batchId, 'processing', 'completed');
     await bumpStateCount(msg.ownerId, state);
@@ -231,35 +348,32 @@ async function processDocument(msg: AnalysisMessage): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
-// Scoring glue (reuses the pure @app/shared core)
+// Scoring glue (reuses the pure @app/shared core as the FALLBACK path)
 // ---------------------------------------------------------------------------
 
-interface ScoreDocInput {
+interface DeterministicScoreInput {
   extraction?: Extraction;
   profile: Profile;
   priorConcepts: string[];
-  publishedAt?: string;
+  freshness: number;
   isDup: boolean;
   now: Date;
 }
 
 /**
- * Build a {@link ScoreInput} from the extraction + profile + prior concepts and
- * compute all four scores plus MKV. When extraction is undefined (degraded) the
- * concept/topic sets are empty, so a recommendation is still produced from
- * metadata only (Req 4.5). `freshnessEstimated` is reported when the published
- * date is missing (Req 5.9).
+ * Deterministic FALLBACK scorer: the original string-match relevance/novelty/
+ * redundancy from `@app/shared`, reused verbatim when LLM scoring fails or the
+ * document is degraded (no extraction). Freshness is passed in (already
+ * computed) so both paths share one freshness value; MKV is recomputed here.
  */
-function scoreDocument(input: ScoreDocInput): {
-  scores: Scores;
-  freshnessEstimated: boolean;
-} {
-  const { extraction, profile, priorConcepts, publishedAt, isDup, now: nowDate } = input;
+function deterministicScores(input: DeterministicScoreInput): Scores {
+  const { extraction, profile, priorConcepts, freshness, isDup, now: nowDate } = input;
 
   const interests = normalizeConcepts([
     ...profile.highInterests,
     ...profile.mediumInterests,
     ...profile.currentlyResearching,
+    ...profile.activeContexts,
   ]);
   const known = normalizeConcepts([...profile.alreadyKnown, ...priorConcepts]);
   const docConcepts = normalizeConcepts(extraction?.concepts ?? []);
@@ -270,7 +384,6 @@ function scoreDocument(input: ScoreDocInput): {
     docTopics,
     interests,
     known,
-    publishedAt,
     now: nowDate,
     isExactPriorDuplicate: isDup,
   };
@@ -278,14 +391,66 @@ function scoreDocument(input: ScoreDocInput): {
   const relevance = computeRelevance(scoreInput);
   const novelty = computeNovelty(scoreInput);
   const redundancy = computeRedundancy(scoreInput);
-  const freshness = computeFreshness(scoreInput);
   const base: Scores = { relevance, novelty, redundancy, freshness, mkv: 0 };
-  const mkv = computeMkv(base);
+  return { ...base, mkv: computeMkv(base) };
+}
 
-  return {
-    scores: { relevance, novelty, redundancy, freshness, mkv },
-    freshnessEstimated: !publishedAt, // Req 5.9
-  };
+/**
+ * Resolve the EFFECTIVE profile for scoring. "Bring your own": when the stored
+ * profile carries a public `profileSourceUrl`, fetch it (bounded, 10s / 20KB)
+ * at analysis time and use its text as the profile `context`, WITHOUT
+ * persisting the fetched content — only the URL is stored (the user owns the
+ * data). On any fetch failure, fall back to the stored profile unchanged.
+ */
+async function resolveEffectiveProfile(profile: Profile): Promise<Profile> {
+  // 1. Private repo source (preferred when configured): fetch with the user's
+  // token from Secrets Manager. Never persisted; falls back on any failure.
+  const repoUrl = profile.profileRepoUrl?.trim();
+  if (repoUrl && /^https:\/\//i.test(repoUrl)) {
+    try {
+      const token = await getUserToken(profile.userId);
+      if (token) {
+        const text = await fetchProfileSource(repoUrl, token);
+        if (text) return { ...profile, context: text };
+      }
+    } catch {
+      // Ignore and try the public source / stored profile next.
+    }
+  }
+
+  // 2. Public "bring your own" source.
+  const url = profile.profileSourceUrl?.trim();
+  if (!url || !/^https:\/\//i.test(url)) return profile;
+
+  try {
+    const text = await fetchProfileSource(url);
+    if (text) {
+      // The fetched rich text becomes the primary "About you" signal; stored
+      // list fields still ride along for the deterministic fallback.
+      return { ...profile, context: text };
+    }
+  } catch {
+    // Ignore and fall back to the stored profile.
+  }
+  return profile;
+}
+
+/** Bounded fetch of the user's profile source (never throws upward). An
+ * optional bearer token authenticates a private-repo raw URL. */
+async function fetchProfileSource(url: string, token?: string): Promise<string | undefined> {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), PROFILE_FETCH_TIMEOUT_MS);
+  timer.unref?.();
+  try {
+    const headers: Record<string, string> = {};
+    if (token) headers.Authorization = `Bearer ${token}`;
+    const res = await fetch(url, { signal: ctrl.signal, redirect: 'follow', headers });
+    if (!res.ok) return undefined;
+    const raw = (await res.text()).trim();
+    return raw ? raw.slice(0, PROFILE_FETCH_MAX_CHARS) : undefined;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -319,6 +484,7 @@ async function getProfile(ownerId: string): Promise<Profile> {
     currentlyResearching: [],
     alreadyKnown: [],
     avoidContentTypes: [],
+    activeContexts: [],
     notConfigured: true,
     createdAt: ts,
     updatedAt: ts,
@@ -414,51 +580,86 @@ interface CompletedUpdate {
   degraded: boolean;
   failureReason?: string;
   s3ContentRef?: string;
+  readingMinutes?: number;
 }
 
 /**
  * Persist the completed analysis onto the document. Sets `stateKey` for the
- * `byOwnerState` GSI (`<state>#<documentId>`). Undefined values are dropped by
- * the document client's `removeUndefinedValues` marshalling.
+ * `byOwnerState` GSI (`<state>#<documentId>`).
+ *
+ * The optional fields (`extraction`, `failureReason`, `s3ContentRef`) are only
+ * referenced in the expression when they actually have a value: the document
+ * client strips `undefined` from the attribute-value map, so naming `:x` in the
+ * expression while `x` is undefined makes DynamoDB reject the whole update
+ * ("expression attribute value ... is not defined"). Absent fields are REMOVEd
+ * instead, keeping the item clean.
  */
 async function persistCompleted(msg: AnalysisMessage, u: CompletedUpdate): Promise<void> {
   const stateKey = `${u.state}#${msg.documentId}`;
+
+  const setParts = [
+    '#status = :status',
+    'metadata = :metadata',
+    'scores = :scores',
+    'recommendationState = :state',
+    'tags = :tags',
+    'stateKey = :stateKey',
+    'explanation = :explanation',
+    'explanationUnavailable = :explanationUnavailable',
+    'degraded = :degraded',
+    'updatedAt = :ts',
+  ];
+  const values: Record<string, unknown> = {
+    ':status': 'completed',
+    ':metadata': u.metadata,
+    ':scores': u.scores,
+    ':state': u.state,
+    ':tags': u.tags,
+    ':stateKey': stateKey,
+    ':explanation': u.explanation,
+    ':explanationUnavailable': u.explanationUnavailable,
+    ':degraded': u.degraded,
+    ':ts': now(),
+  };
+
+  // Optional fields: SET when present, REMOVE when absent (never name an
+  // undefined value in the expression).
+  const removeParts: string[] = [];
+  if (u.extraction !== undefined) {
+    setParts.push('extraction = :extraction');
+    values[':extraction'] = u.extraction;
+  } else {
+    removeParts.push('extraction');
+  }
+  if (u.failureReason !== undefined) {
+    setParts.push('failureReason = :failureReason');
+    values[':failureReason'] = u.failureReason;
+  } else {
+    removeParts.push('failureReason');
+  }
+  if (u.s3ContentRef !== undefined) {
+    setParts.push('s3ContentRef = :s3ContentRef');
+    values[':s3ContentRef'] = u.s3ContentRef;
+  } else {
+    removeParts.push('s3ContentRef');
+  }
+  if (u.readingMinutes !== undefined) {
+    setParts.push('readingMinutes = :readingMinutes');
+    values[':readingMinutes'] = u.readingMinutes;
+  } else {
+    removeParts.push('readingMinutes');
+  }
+
+  const updateExpression =
+    `SET ${setParts.join(', ')}` + (removeParts.length ? ` REMOVE ${removeParts.join(', ')}` : '');
 
   await ddb.send(
     new UpdateCommand({
       TableName: TABLE_NAMES.DOCUMENTS,
       Key: { documentId: msg.documentId },
-      UpdateExpression: [
-        'SET #status = :status',
-        'metadata = :metadata',
-        'extraction = :extraction',
-        'scores = :scores',
-        'recommendationState = :state',
-        'tags = :tags',
-        'stateKey = :stateKey',
-        'explanation = :explanation',
-        'explanationUnavailable = :explanationUnavailable',
-        'degraded = :degraded',
-        'failureReason = :failureReason',
-        's3ContentRef = :s3ContentRef',
-        'updatedAt = :ts',
-      ].join(', '),
+      UpdateExpression: updateExpression,
       ExpressionAttributeNames: { '#status': 'status' },
-      ExpressionAttributeValues: {
-        ':status': 'completed',
-        ':metadata': u.metadata,
-        ':extraction': u.extraction,
-        ':scores': u.scores,
-        ':state': u.state,
-        ':tags': u.tags,
-        ':stateKey': stateKey,
-        ':explanation': u.explanation,
-        ':explanationUnavailable': u.explanationUnavailable,
-        ':degraded': u.degraded,
-        ':failureReason': u.failureReason,
-        ':s3ContentRef': u.s3ContentRef,
-        ':ts': now(),
-      },
+      ExpressionAttributeValues: values,
     })
   );
 }

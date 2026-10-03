@@ -8,6 +8,13 @@ export const ROLES = {
 
 export type Role = (typeof ROLES)[keyof typeof ROLES];
 
+// Daily cap on NEW documents a USER may enqueue for analysis (cost control for
+// open/multi-user deployments). Counts only new documents actually enqueued —
+// duplicates, already-owned URLs and rejected lines do not consume quota.
+// ADMIN is unlimited. The excess is NOT dropped silently: a hard block returns
+// the unprocessed URLs so the user can save them and retry the next day.
+export const DAILY_IMPORT_LIMIT_USER = 50;
+
 // Recommendation state — the single verdict per analyzed document (Req 6.1).
 export const RECOMMENDATION_STATE = ['READ', 'SKIM', 'SKIP'] as const;
 export type RecommendationState = (typeof RECOMMENDATION_STATE)[number];
@@ -38,10 +45,10 @@ const getTableName = (key: string, defaultName: string) => {
 };
 
 export const TABLE_NAMES = {
-  USERS: getTableName('TABLE_USERS', '{{PROJECT_NAME}}-users-test'),
-  PROFILES: getTableName('TABLE_PROFILES', '{{PROJECT_NAME}}-profiles-test'),
-  BATCHES: getTableName('TABLE_BATCHES', '{{PROJECT_NAME}}-batches-test'),
-  DOCUMENTS: getTableName('TABLE_DOCUMENTS', '{{PROJECT_NAME}}-documents-test'),
+  USERS: getTableName('TABLE_USERS', 'knowledge-inbox-zero-users-test'),
+  PROFILES: getTableName('TABLE_PROFILES', 'knowledge-inbox-zero-profiles-test'),
+  BATCHES: getTableName('TABLE_BATCHES', 'knowledge-inbox-zero-batches-test'),
+  DOCUMENTS: getTableName('TABLE_DOCUMENTS', 'knowledge-inbox-zero-documents-test'),
 } as const;
 
 // Type names used as discriminators / in the audit log.

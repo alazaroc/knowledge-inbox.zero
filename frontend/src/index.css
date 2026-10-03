@@ -41,11 +41,32 @@ html {
       0.75rem calc(env(safe-area-inset-left) + 1rem);
   }
 
+  /* Fill the top safe-area (notch / status bar) with the header's own white,
+     so it isn't the transparent page background showing through on iOS with
+     viewport-fit=cover. A fixed strip sits behind the sticky header. */
+  .app-header::before {
+    content: '';
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: env(safe-area-inset-top);
+    background: #ffffff;
+    z-index: 40;
+    pointer-events: none;
+  }
+
   .app-main {
     padding: 1rem;
     padding-right: calc(env(safe-area-inset-right) + 1rem);
     padding-bottom: calc(env(safe-area-inset-bottom) + 1rem);
-    max-width: 900px;
+  }
+
+  /* One shared content width for header, main and footer so the whole shell
+     lines up vertically instead of each section picking its own width. */
+  .app-shell-width {
+    width: 100%;
+    max-width: 1024px;
     margin-inline: auto;
   }
 

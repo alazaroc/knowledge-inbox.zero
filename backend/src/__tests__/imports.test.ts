@@ -1,5 +1,5 @@
 import type { APIGatewayProxyEvent } from 'aws-lambda';
-import { GetCommand, PutCommand } from '@aws-sdk/lib-dynamodb';
+import { GetCommand, PutCommand, UpdateCommand } from '@aws-sdk/lib-dynamodb';
 import fc from 'fast-check';
 import {
   TABLE_NAMES,
@@ -55,6 +55,11 @@ function authAs(sub: string) {
   verifyToken.mockResolvedValue({ sub, email: 'u@test.dev', role: 'USER' });
 }
 
+/** Authenticated as an ADMIN (no daily import quota). */
+function authAsAdmin(sub: string) {
+  verifyToken.mockResolvedValue({ sub, email: 'admin@test.dev', role: 'ADMIN' });
+}
+
 /**
  * Default DynamoDB behaviour: every GetCommand (existing-doc check) returns an
  * empty object (no existing document), and every PutCommand resolves. This lets
@@ -87,7 +92,9 @@ function anyBatchPut(): boolean {
 
 beforeEach(() => {
   jest.clearAllMocks();
-  authAs(SUB);
+  // Default to ADMIN (no daily quota) so the batch-cap, dedup and partition
+  // tests are isolated from the per-user daily limit, which has its own block.
+  authAsAdmin(SUB);
   ddbNoExistingDocs();
   process.env.ANALYSIS_QUEUE_URL = 'https://sqs.test/queue';
   sqsSend.mockResolvedValue({});
@@ -306,5 +313,126 @@ describe('imports handler — within-submission dedup (Req 2.6)', () => {
 
     // One SQS message batch enqueued (2 docs ≤ batch size of 10).
     expect(sqsSend).toHaveBeenCalledTimes(1);
+  });
+});
+
+// --- Daily import quota (cost control, USER role) ------------------------
+// Validates the hard block: a USER may enqueue at most DAILY_IMPORT_LIMIT_USER
+// new documents per UTC day. Excess URLs are NOT dropped silently — they are
+// returned in `blocked` so the user can save and retry tomorrow. ADMIN is
+// unlimited. Quota counts NEW documents only (duplicates/rejected don't count).
+describe('imports handler — daily quota hard block (USER)', () => {
+  const url = (i: number) => `https://example.com/q-${i}`;
+
+  // Configure DynamoDB mock: no existing docs, and today's USAGE counter reads
+  // back `usedToday` (the USAGE#<owner>#<day> item carries `{ count }`).
+  function ddbWithUsage(usedToday: number) {
+    send.mockImplementation((cmd: unknown) => {
+      if (cmd instanceof GetCommand) {
+        const key = (cmd as GetCommand).input.Key as { documentId?: string } | undefined;
+        if (typeof key?.documentId === 'string' && key.documentId.startsWith('USAGE#')) {
+          return Promise.resolve({ Item: { count: usedToday } });
+        }
+        return Promise.resolve({}); // no existing document
+      }
+      return Promise.resolve({});
+    });
+  }
+
+  /** The ADD applied to the USAGE counter, if any (its :n value). */
+  function usageIncrement(): number | undefined {
+    const upd = send.mock.calls
+      .map((c) => c[0] as unknown)
+      .filter((cmd): cmd is UpdateCommand => cmd instanceof UpdateCommand)
+      .find((cmd) => {
+        const key = cmd.input.Key as { documentId?: string } | undefined;
+        return typeof key?.documentId === 'string' && key.documentId.startsWith('USAGE#');
+      });
+    return upd?.input.ExpressionAttributeValues?.[':n'] as number | undefined;
+  }
+
+  it('enqueues all URLs and consumes quota when under the limit', async () => {
+    authAs(SUB);
+    ddbWithUsage(0);
+
+    const blob = Array.from({ length: 10 }, (_, i) => url(i)).join('\n');
+    const res = await handler(postImports(blob));
+
+    expect(res.statusCode).toBe(201);
+    const body = JSON.parse(res.body) as {
+      pending: number;
+      blocked: string[];
+      dailyLimit: number;
+      remaining: number;
+    };
+    expect(body.pending).toBe(10);
+    expect(body.blocked).toHaveLength(0);
+    expect(body.dailyLimit).toBe(50);
+    expect(body.remaining).toBe(40);
+    expect(usageIncrement()).toBe(10);
+  });
+
+  it('hard-blocks the excess and returns the unprocessed URLs', async () => {
+    authAs(SUB);
+    ddbWithUsage(45); // only 5 of today's 50 left
+
+    const blob = Array.from({ length: 12 }, (_, i) => url(i)).join('\n');
+    const res = await handler(postImports(blob));
+
+    expect(res.statusCode).toBe(201);
+    const body = JSON.parse(res.body) as { pending: number; blocked: string[]; remaining: number };
+
+    // Only 5 enqueued; the remaining 7 are returned as blocked (not dropped).
+    expect(body.pending).toBe(5);
+    expect(body.blocked).toHaveLength(7);
+    expect(body.remaining).toBe(0);
+
+    // The 5 enqueued are the FIRST five; the 7 blocked are the rest, in order.
+    const docs = putItemsForTable<KnowledgeDocument>(TABLE_NAMES.DOCUMENTS);
+    expect(docs).toHaveLength(5);
+    expect(body.blocked).toEqual(Array.from({ length: 7 }, (_, i) => url(i + 5)));
+
+    // Quota consumed only for the 5 enqueued.
+    expect(usageIncrement()).toBe(5);
+  });
+
+  it('blocks everything when the day is already exhausted, creating no documents', async () => {
+    authAs(SUB);
+    ddbWithUsage(50); // nothing left today
+
+    const blob = Array.from({ length: 3 }, (_, i) => url(i)).join('\n');
+    const res = await handler(postImports(blob));
+
+    expect(res.statusCode).toBe(201);
+    const body = JSON.parse(res.body) as { pending: number; blocked: string[] };
+    expect(body.pending).toBe(0);
+    expect(body.blocked).toHaveLength(3);
+    expect(putItemsForTable<KnowledgeDocument>(TABLE_NAMES.DOCUMENTS)).toHaveLength(0);
+    // No quota consumed when nothing was enqueued.
+    expect(usageIncrement()).toBeUndefined();
+    // No SQS messages sent.
+    expect(sqsSend).not.toHaveBeenCalled();
+  });
+
+  it('ADMIN has no quota: all URLs enqueued, no blocked, no usage write', async () => {
+    authAsAdmin(SUB);
+    ddbWithUsage(999); // irrelevant for admin
+
+    const blob = Array.from({ length: 80 }, (_, i) => url(i)).join('\n');
+    const res = await handler(postImports(blob));
+
+    expect(res.statusCode).toBe(201);
+    const body = JSON.parse(res.body) as {
+      pending: number;
+      blocked: string[];
+      dailyLimit: number | null;
+      remaining: number | null;
+    };
+    expect(body.pending).toBe(80);
+    expect(body.blocked).toHaveLength(0);
+    expect(body.dailyLimit).toBeNull();
+    expect(body.remaining).toBeNull();
+    // No USAGE increment for admin.
+    expect(usageIncrement()).toBeUndefined();
   });
 });

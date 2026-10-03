@@ -1,0 +1,17 @@
+// TypeScript config used ONLY by Jest (ts-jest) to run the tests.
+//
+// The runtime build (tsconfig.json) targets NodeNext/ESM, matching the
+// workspace's "type": "module". Jest, however, runs the tests through ts-jest's
+// classic CommonJS transform; transpiling the sources to CommonJS here lets the
+// `jest` global be injected normally (no VM-module ESM, which would require
+// importing `jest` from `@jest/globals` in every test file). This file only
+// affects test transpilation — the shipped Lambda bundles still use the ESM
+// tsconfig.json.
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "module": "commonjs",
+    "moduleResolution": "node",
+    "verbatimModuleSyntax": false
+  }
+}

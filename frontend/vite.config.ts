@@ -36,9 +36,10 @@ export default defineConfig({
       includeAssets: ['logo.svg', 'apple-touch-icon.png'],
       manifest: {
         id: '/',
-        name: '{{PROJECT_NAME}}',
-        short_name: '{{PROJECT_NAME}}',
-        description: 'App bootstrapped from the serverless-monorepo-aws-starter.',
+        name: 'Knowledge Inbox Zero',
+        short_name: 'Inbox Zero',
+        description:
+          'Stop hoarding links you never read. An AI filter scores every link against your interests so you only read what is actually worth it.',
         theme_color: '#4f46e5',
         background_color: '#ffffff',
         display: 'standalone',
@@ -46,10 +47,13 @@ export default defineConfig({
         start_url: '/',
         scope: '/',
         lang: 'en',
+        categories: ['productivity', 'news', 'utilities'],
         icons: [
           { src: '/logo.svg', sizes: 'any', type: 'image/svg+xml', purpose: 'any' },
           { src: '/pwa-192.png', sizes: '192x192', type: 'image/png', purpose: 'any' },
-          { src: '/pwa-512.png', sizes: '512x512', type: 'image/png', purpose: 'any maskable' },
+          { src: '/pwa-192.png', sizes: '192x192', type: 'image/png', purpose: 'maskable' },
+          { src: '/pwa-512.png', sizes: '512x512', type: 'image/png', purpose: 'any' },
+          { src: '/pwa-512.png', sizes: '512x512', type: 'image/png', purpose: 'maskable' },
         ],
       },
       workbox: {

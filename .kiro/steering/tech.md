@@ -32,7 +32,7 @@
 
 - **ESLint 9** (flat config, `typescript-eslint`), **Prettier**, **Stylelint** for CSS.
 - **husky** + **lint-staged** on pre-commit (eslint --fix + prettier on staged files).
-- CI: `.github/workflows/pipeline.yml` runs `lint → test → build` (incl. `cdk synth`); deploys to `test` on non-`main` branches, `prod` on `main`, via OIDC.
+- CI: `.github/workflows/pipeline.yml` runs `lint → test → build` (incl. `cdk synth`); deploys to `prod` on `main` via OIDC. The `test` deploy job is commented out (test environment retired for now).
 
 ## Common commands
 
@@ -67,9 +67,9 @@ make typecheck       # type-check all workspaces
 ### Deploy (deploy.sh skips unchanged components unless FORCE_DEPLOY=true)
 
 ```bash
-make deploy ENV=test              # infra + frontend
-make deploy-backend ENV=test      # CDK only
-make deploy-frontend ENV=test     # frontend only (build + S3 sync + invalidation)
+make deploy ENV=prod              # infra + frontend
+make deploy-backend ENV=prod      # CDK only
+make deploy-frontend ENV=prod     # frontend only (build + S3 sync + invalidation)
 make deploy ENV=prod FORCE_DEPLOY=true
 ```
 

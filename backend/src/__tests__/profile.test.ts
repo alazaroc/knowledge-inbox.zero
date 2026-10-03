@@ -56,6 +56,7 @@ describe('profile handler — GET (empty-profile default, Req 1.4)', () => {
     expect(profile.currentlyResearching).toEqual([]);
     expect(profile.alreadyKnown).toEqual([]);
     expect(profile.avoidContentTypes).toEqual([]);
+    expect(profile.activeContexts).toEqual([]);
   });
 
   it('returns the stored profile when one exists', async () => {
@@ -66,7 +67,9 @@ describe('profile handler — GET (empty-profile default, Req 1.4)', () => {
       currentlyResearching: [],
       alreadyKnown: [],
       avoidContentTypes: [],
+      activeContexts: [],
       context: 'hi',
+      profileSourceUrl: '',
       createdAt: '2024-01-01T00:00:00.000Z',
       updatedAt: '2024-01-01T00:00:00.000Z',
     };
@@ -127,6 +130,7 @@ describe('profile handler — PUT replace semantics (Req 1.3)', () => {
         highInterests: ['serverless', 'ai'],
         mediumInterests: ['design'],
         currentlyResearching: ['bedrock'],
+        activeContexts: ['kiz'],
         alreadyKnown: ['dynamodb'],
         avoidContentTypes: ['video'],
         context: 'builder',
@@ -145,6 +149,7 @@ describe('profile handler — PUT replace semantics (Req 1.3)', () => {
     expect(saved.highInterests).toEqual(['serverless', 'ai']);
     expect(saved.mediumInterests).toEqual(['design']);
     expect(saved.currentlyResearching).toEqual(['bedrock']);
+    expect(saved.activeContexts).toEqual(['kiz']);
     expect(saved.alreadyKnown).toEqual(['dynamodb']);
     expect(saved.avoidContentTypes).toEqual(['video']);
     expect(saved.context).toBe('builder');
@@ -170,16 +175,16 @@ describe('profile handler — PUT replace semantics (Req 1.3)', () => {
 });
 
 describe('profile handler — PUT validation rejection (Req 1.5, 1.8)', () => {
-  it('rejects a context longer than 5000 chars and persists nothing', async () => {
-    const res = await handler(event('PUT', { context: 'a'.repeat(5001) }));
+  it('rejects a context longer than 2000 chars and persists nothing', async () => {
+    const res = await handler(event('PUT', { context: 'a'.repeat(2001) }));
 
     expect(res.statusCode).toBe(400);
     // No DynamoDB interaction at all when the body fails validation.
     expect(send).not.toHaveBeenCalled();
   });
 
-  it('rejects a list with more than 100 entries and persists nothing', async () => {
-    const tooMany = Array.from({ length: 101 }, (_, i) => `entry-${i}`);
+  it('rejects a list with more than 50 entries and persists nothing', async () => {
+    const tooMany = Array.from({ length: 51 }, (_, i) => `entry-${i}`);
     const res = await handler(event('PUT', { highInterests: tooMany }));
 
     expect(res.statusCode).toBe(400);

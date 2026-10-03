@@ -26,9 +26,11 @@ jest.mock('../lib/retrieve.js', () => ({
 
 const bedrockExtract = jest.fn();
 const bedrockExplain = jest.fn();
+const bedrockScore = jest.fn();
 jest.mock('../lib/bedrock.js', () => ({
   bedrockExtract: (...a: unknown[]) => bedrockExtract(...a),
   bedrockExplain: (...a: unknown[]) => bedrockExplain(...a),
+  bedrockScore: (...a: unknown[]) => bedrockScore(...a),
 }));
 
 const s3Send = jest.fn();
@@ -83,6 +85,10 @@ beforeEach(() => {
   s3Send.mockResolvedValue({});
   bedrockExtract.mockResolvedValue(validExtraction());
   bedrockExplain.mockResolvedValue(LONG_EXPLANATION);
+  // Default: LLM scoring fails, so the worker uses the deterministic fallback
+  // scorer and the dedicated bedrockExplain path (these suites assert on both).
+  // The happy-path "reasoning becomes explanation" case is tested explicitly.
+  bedrockScore.mockRejectedValue(new Error('llm scoring unavailable in this suite'));
 });
 
 // --- Degraded path (Req 4.5) ---------------------------------------------
@@ -240,5 +246,69 @@ describe('worker — explanation placeholder with scores still persisted (Req 6.
     const doc = store.documents.get(DOC)!;
     expect(doc.explanation).toBe(LONG_EXPLANATION);
     expect(doc.explanationUnavailable).toBe(false);
+  });
+});
+
+// --- LLM scoring (bedrockScore) is the primary path ----------------------
+describe('worker — bedrockScore drives scores and reasoning becomes the explanation', () => {
+  const REASONING =
+    'This matters to you because it introduces a genuinely new serverless pattern you have not covered yet.';
+
+  it('uses LLM relevance/novelty/redundancy and the reasoning as the explanation (no bedrockExplain)', async () => {
+    retrieveReadable.mockResolvedValue({
+      text: 'readable content',
+      html: '<html>readable content</html>',
+      metadata: { sourceDomain: 'example.com' },
+      degraded: false,
+    });
+    bedrockScore.mockResolvedValue({
+      relevance: 82,
+      novelty: 71,
+      redundancy: 12,
+      reasoning: REASONING,
+    });
+
+    await runOne();
+
+    const doc = store.documents.get(DOC)!;
+    expect(doc.scores?.relevance).toBe(82);
+    expect(doc.scores?.novelty).toBe(71);
+    expect(doc.scores?.redundancy).toBe(12);
+    // Explanation comes from the scoring reasoning; not "unavailable".
+    expect(doc.explanation).toBe(REASONING);
+    expect(doc.explanationUnavailable).toBe(false);
+    // The dedicated explanation call is skipped when reasoning is present.
+    expect(bedrockExplain).not.toHaveBeenCalled();
+    expect(doc.status).toBe('completed');
+  });
+
+  // Token-cost control (block 2a): a DISCARDED document (state SKIP) does not
+  // spend a bedrockExplain call when there is no reusable scoring reasoning;
+  // the placeholder is used instead.
+  it('skips bedrockExplain for a discarded (SKIP) document and uses the placeholder', async () => {
+    const PLACEHOLDER = 'Explanation unavailable; recommendation and scores were still computed.';
+    retrieveReadable.mockResolvedValue({
+      text: 'readable content',
+      html: '<html>readable content</html>',
+      metadata: { sourceDomain: 'example.com' },
+      degraded: false,
+    });
+    // redundancy >= 80 forces SKIP; a short reasoning (< 50 chars) is not usable
+    // as the explanation, so without the guard the worker would call explain.
+    bedrockScore.mockResolvedValue({
+      relevance: 10,
+      novelty: 5,
+      redundancy: 90,
+      reasoning: 'redundant',
+    });
+
+    await runOne();
+
+    const doc = store.documents.get(DOC)!;
+    expect(doc.recommendationState).toBe('SKIP');
+    expect(bedrockExplain).not.toHaveBeenCalled();
+    expect(doc.explanation).toBe(PLACEHOLDER);
+    expect(doc.explanationUnavailable).toBe(true);
+    expect(doc.status).toBe('completed');
   });
 });

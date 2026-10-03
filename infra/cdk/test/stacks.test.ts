@@ -29,6 +29,7 @@ function makeNaming(): ResourceNaming {
     environment: 'test',
     account: '123456789012',
     version: '0.1.0',
+    repository: 'https://github.com/alazaroc/knowledge-inbox-zero',
   });
 }
 
@@ -220,6 +221,48 @@ describeApi('ApiStack (SQS worker + DLQ + Bedrock IAM)', () => {
             Match.objectLike({
               Effect: 'Allow',
               Action: 'bedrock:InvokeModel',
+            }),
+          ]),
+        }),
+      })
+    );
+  });
+
+  // Regression guard: the GLOBAL inference profile can route to ANY region in
+  // the partition, so the policy must grant the model-scoped foundation-model
+  // ARN with a region wildcard `*` (not a fixed list, which already omitted
+  // eu-south-1 under the EU profile → AccessDenied). The inference-profile ARN
+  // is likewise region-wildcarded for the global profile.
+  it('covers the foundation-model across all regions with a wildcard (not a fixed list)', () => {
+    template.hasResourceProperties(
+      'AWS::IAM::Policy',
+      Match.objectLike({
+        PolicyDocument: Match.objectLike({
+          Statement: Match.arrayWith([
+            Match.objectLike({
+              Action: 'bedrock:InvokeModel',
+              Resource: Match.arrayWith([
+                Match.stringLikeRegexp('^arn:aws:bedrock:\\*::foundation-model/'),
+              ]),
+            }),
+          ]),
+        }),
+      })
+    );
+  });
+
+  // The global inference-profile ARN itself is region-wildcarded too.
+  it('grants the global inference-profile ARN with a region wildcard', () => {
+    template.hasResourceProperties(
+      'AWS::IAM::Policy',
+      Match.objectLike({
+        PolicyDocument: Match.objectLike({
+          Statement: Match.arrayWith([
+            Match.objectLike({
+              Action: 'bedrock:InvokeModel',
+              Resource: Match.arrayWith([
+                Match.stringLikeRegexp('^arn:aws:bedrock:\\*:.*:inference-profile/global\\.'),
+              ]),
             }),
           ]),
         }),

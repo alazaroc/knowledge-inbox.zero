@@ -86,26 +86,26 @@ describe('scoresToRecommendationState — fully redundant (Req 6.1)', () => {
 // ===========================================================================
 
 describe('profileSchema — context length (Req 1.5)', () => {
-  it('accepts a context of exactly 5000 characters', () => {
-    const result = profileSchema.safeParse({ context: 'a'.repeat(5000) });
+  it('accepts a context of exactly 2000 characters', () => {
+    const result = profileSchema.safeParse({ context: 'a'.repeat(2000) });
     expect(result.success).toBe(true);
   });
 
-  it('rejects a context of 5001 characters', () => {
-    const result = profileSchema.safeParse({ context: 'a'.repeat(5001) });
+  it('rejects a context of 2001 characters', () => {
+    const result = profileSchema.safeParse({ context: 'a'.repeat(2001) });
     expect(result.success).toBe(false);
   });
 });
 
 describe('profileSchema — list entry count (Req 1.8)', () => {
-  it('accepts a list with exactly 100 entries', () => {
-    const highInterests = Array.from({ length: 100 }, (_, i) => `topic-${i}`);
+  it('accepts a list with exactly 50 entries', () => {
+    const highInterests = Array.from({ length: 50 }, (_, i) => `topic-${i}`);
     const result = profileSchema.safeParse({ highInterests });
     expect(result.success).toBe(true);
   });
 
-  it('rejects a list with 101 entries', () => {
-    const highInterests = Array.from({ length: 101 }, (_, i) => `topic-${i}`);
+  it('rejects a list with 51 entries', () => {
+    const highInterests = Array.from({ length: 51 }, (_, i) => `topic-${i}`);
     const result = profileSchema.safeParse({ highInterests });
     expect(result.success).toBe(false);
   });

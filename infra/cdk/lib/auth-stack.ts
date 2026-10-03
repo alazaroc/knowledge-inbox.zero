@@ -18,7 +18,7 @@ export class AuthStack extends cdk.Stack {
 
     this.userPool = new cognito.UserPool(this, 'UserPool', {
       userPoolName: naming.standard('users'),
-      selfSignUpEnabled: false, // invite-only (admin creates users)
+      selfSignUpEnabled: true, // public sign-up (self-registration) enabled
       signInAliases: { email: true },
       autoVerify: { email: true },
       passwordPolicy: {
@@ -28,9 +28,8 @@ export class AuthStack extends cdk.Stack {
         requireDigits: true,
         requireSymbols: true,
       },
-      // Mandatory TOTP MFA.
-      mfa: cognito.Mfa.REQUIRED,
-      mfaSecondFactor: { sms: false, otp: true },
+      // MFA disabled: sign-in is CREDENTIALS -> (NEW_PASSWORD/RESET_PASSWORD) -> DONE.
+      mfa: cognito.Mfa.OFF,
       customAttributes: {
         role: new cognito.StringAttribute({ mutable: true }),
       },

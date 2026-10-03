@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # Creates a user in the Cognito User Pool and tags it with a role.
 #
-# Usage (default environment: test):
+# Usage (default environment: prod):
 #   ./scripts/create-user.sh email@example.com 'PasswordTemp.123' USER
 #   ./scripts/create-user.sh email@example.com 'PasswordTemp.123' ADMIN
 
 set -euo pipefail
 
-ENV=${ENV:-test}
-PROJECT={{PROJECT_NAME}}
+ENV=${ENV:-prod}
+PROJECT=knowledge-inbox-zero
 
 EMAIL=${1:?Missing EMAIL}
 PASSWORD=${2:?Missing temporary PASSWORD}

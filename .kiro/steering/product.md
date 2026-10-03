@@ -42,6 +42,6 @@ Every product decision answers one question: **"What deserves this user's attent
 
 ## Environments & regions
 
-- Environments: `test` and `prod`.
-- Default region: `eu-south-2` (configurable via the `{{AWS_REGION}}` placeholder).
-- Two template placeholders remain repo-wide: `{{PROJECT_NAME}}` and `{{AWS_REGION}}`. Internal package names use the fixed `@app/*` scope and are not renamed.
+- Environment: `prod` (the `test` environment is retired for now).
+- Default region: `eu-south-2` (configurable via the `eu-south-2` placeholder).
+- Two template placeholders remain repo-wide: `knowledge-inbox-zero` and `eu-south-2`. Internal package names use the fixed `@app/*` scope and are not renamed.
